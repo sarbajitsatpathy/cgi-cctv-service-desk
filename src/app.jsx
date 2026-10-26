@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { isSameOriginRequest } from '@freebuff/auth';
+import { createDefaultClient } from './db.js';
 
 import {
   REQUEST_TYPES,
@@ -29,6 +30,7 @@ import {
   statusCounts,
   updateTechnician,
   updateTicket,
+  listTechnicians,
 } from './db.js';
 import { autoSchedule } from './schedule.js';
 import { Dashboard, NewRequestPage, TicketPage } from './pages/customer.jsx';
@@ -81,7 +83,6 @@ function icsText(value) {
 export function buildApp(auth, env) {
   const app = new Hono();
 
-  // Schema, session, roles and private-cache headers for every request.
   app.use('*', async (c, next) => {
     await ensureSchema(env);
     c.set('db', c.get('db') || createDefaultClient(env));
@@ -126,8 +127,6 @@ export function buildApp(auth, env) {
     }
   });
 
-  // --- public pages ---
-
   app.get('/', (c) => c.html(<Landing user={c.get('user')} />));
 
   app.get('/signin', (c) => {
@@ -145,8 +144,6 @@ export function buildApp(auth, env) {
       />,
     );
   });
-
-  // --- customer pages ---
 
   app.get('/dashboard', async (c) => {
     const user = c.get('user');
@@ -216,8 +213,6 @@ export function buildApp(auth, env) {
     return c.redirect(`/ticket/${fresh.id}?created=1`, 303);
   });
 
-  // --- ticket page ---
-
   async function loadTicketForUser(c, api = false) {
     const user = c.get('user');
     const notFound = api
@@ -275,8 +270,6 @@ export function buildApp(auth, env) {
     );
   });
 
-  // --- JSON API ---
-
   app.get('/api/me', (c) => {
     const user = c.get('user');
     if (!user) return json({ error: 'Sign in required' }, 401);
@@ -319,7 +312,7 @@ export function buildApp(auth, env) {
     const date = ticket.scheduled_date ?? ticket.preferred_date;
     const slot = ticket.scheduled_slot ?? ticket.time_slot;
     const times = SLOTS[slot] ?? SLOTS.morning;
-    const stamp = now().replace(/[-:]/g, '').replace(/\\.\\d{3}/, '');
+    const stamp = now().replace(/[-:]/g, '').replace(/\.\\d{3}/, '');
     const summary = 'CGI CCTV visit - ' + ticket.ticket_no;
     const desc = STATUS_LABELS[ticket.status] + ' - technician: ' + (ticket.technician_name ?? 'to be assigned') + ' - ' + ticket.product;
     const location = ticket.address_line + ', ' + ticket.area;
@@ -347,8 +340,6 @@ export function buildApp(auth, env) {
     ];
     return text(lines.join('\r\n'), 'text/calendar; charset=utf-8');
   });
-
-  // --- admin: first-run setup ---
 
   app.get('/admin/setup', async (c) => {
     const user = c.get('user');
@@ -379,8 +370,6 @@ export function buildApp(auth, env) {
     return c.redirect('/admin', 303);
   });
 
-  // --- admin: overview ---
-
   app.get('/admin', async (c) => {
     const counts = await statusCounts(env);
     const tickets = await listAllTickets('', env);
@@ -402,8 +391,6 @@ export function buildApp(auth, env) {
       />,
     );
   });
-
-  // --- admin: requests ---
 
   app.get('/admin/requests', async (c) => {
     const status = c.req.query('status') ?? '';
@@ -454,7 +441,6 @@ export function buildApp(auth, env) {
     if (needsVisit && !technicianId) return back('Choose a technician before scheduling this job.');
     if (needsVisit && !scheduledDate) return back('Choose a visit date before scheduling this job.');
 
-    // A ticket moved back to "new" is back in the unassigned queue.
     const effectiveTech = status === 'new' ? null : technicianId;
     const changes = [];
     if (status !== ticket.status) changes.push('Status ' + STATUS_LABELS[ticket.status] + ' => ' + STATUS_LABELS[status]);
@@ -481,8 +467,6 @@ export function buildApp(auth, env) {
       303,
     );
   });
-
-  // --- admin: technicians ---
 
   app.get('/admin/technicians', async (c) => {
     const technicians = await listTechnicians(env);
@@ -565,8 +549,6 @@ export function buildApp(auth, env) {
     return c.redirect('/admin/technicians?saved=1', 303);
   });
 
-  // --- admin: team ---
-
   app.get('/admin/admins', async (c) => {
     const admins = await listAdmins(env);
     let code = await getSetting(INVITE_KEY, env);
@@ -611,8 +593,6 @@ export function buildApp(auth, env) {
     return c.redirect('/admin/admins?saved=1', 303);
   });
 
-  // --- admin: join ---
-
   app.get('/admin/join', async (c) => {
     const user = c.get('user');
     if (!user) return c.redirect(`/signin?next=${encodeURIComponent(c.req.raw.url)}`, 303);
@@ -645,13 +625,13 @@ export function buildApp(auth, env) {
     return c.redirect('/admin', 303);
   });
 
-  // --- fallback: static assets, then a 404 page ---
-
   app.notFound(async (c) => {
     const path = new URL(c.req.raw.url).pathname;
     if (path.startsWith('/api/')) return json({ error: 'Not found' }, 404);
     if (!path.startsWith('/auth/')) {
-      const asset = await c.env.ASSETS.fetch(c.req.raw);
+      const asset = c.env.ASSETS && typeof c.env.ASSETS.fetch === 'function'
+        ? await c.env.ASSETS.fetch(c.req.raw)
+        : await serveStaticFallback(c.req.raw, c.env);
       if (asset.status !== 404) return asset;
     }
     return c.html(<NotFoundPage user={c.get('user')} />, 404);
@@ -661,8 +641,8 @@ export function buildApp(auth, env) {
 }
 
 /** Keeps history readable after a technician is removed. */
-async function updateTicketClearTech(dbRef, env) {
-  const db = dbRef && 'prepare' in dbRef ? dbRef : createDefaultClient(env);
+async function updateTicketClearTech(technicianId, env) {
+  const db = createDefaultClient(env);
   const affected = db
     .prepare('SELECT id FROM tickets WHERE technician_id = ?')
     .bind(technicianId)
@@ -671,7 +651,13 @@ async function updateTicketClearTech(dbRef, env) {
   for (const row of affected) {
     await db
       .prepare(
-        `UPDATE tickets SET\n           technician_id = NULL,\n           status = CASE WHEN status IN ('scheduled','in_progress') THEN 'new' ELSE status END,\n           scheduled_date = CASE WHEN status IN ('scheduled','in_progress') THEN NULL ELSE scheduled_date END,\n           scheduled_slot = CASE WHEN status IN ('scheduled','in_progress') THEN NULL ELSE scheduled_slot END,\n           updated_at = ?\n         WHERE id = ?`
+        `UPDATE tickets SET
+           technician_id = NULL,
+           status = CASE WHEN status IN ('scheduled','in_progress') THEN 'new' ELSE status END,
+           scheduled_date = CASE WHEN status IN ('scheduled','in_progress') THEN NULL ELSE scheduled_date END,
+           scheduled_slot = CASE WHEN status IN ('scheduled','in_progress') THEN NULL ELSE scheduled_slot END,
+           updated_at = ?
+         WHERE id = ?`
       )
       .bind(now(), row.id)
       .run();
@@ -679,5 +665,62 @@ async function updateTicketClearTech(dbRef, env) {
   }
 }
 
-// ---- exported constants used by other modules ----
+async function serveStaticFallback(rawRequest, env) {
+  const url = new URL(rawRequest.url);
+  const path = url.pathname;
 
+  const publicDir = env?.PUBLIC_DIR ?? new URL('./public', import.meta.url).pathname;
+  if (path === '/') {
+    try {
+      const fs = await import('node:fs');
+      const indexPath = join(publicDir, 'index.html');
+      if (fs.existsSync(indexPath)) {
+        return new Response(fs.readFileSync(indexPath), {
+          headers: { 'Content-Type': 'text/html; charset=utf-8' },
+        });
+      }
+    } catch {
+      // fs not available (e.g. browser) — fall through to 404
+    }
+  }
+
+  try {
+    const decoded = decodeURIComponent(path);
+    const filePath = join(publicDir, decoded);
+    if (filePath.startsWith(publicDir)) {
+      const fs = await import('node:fs');
+      if (fs.existsSync(filePath)) {
+        const stats = fs.statSync(filePath);
+        if (stats.isFile()) {
+          const mime = await import('mime-types');
+          const ct = mime.lookup(filePath) ?? 'application/octet-stream';
+          return new Response(fs.readFileSync(filePath), { headers: { 'Content-Type': ct } });
+        }
+      }
+    }
+  } catch {
+    // fs not available — fall through to 404
+  }
+
+  return new Response(null, { status: 404 });
+}
+
+function join(...parts) {
+  const out = parts[0];
+  for (let i = 1; i < parts.length; i++) {
+    out += '/' + parts[i].replace(/^\/+/, '');
+  }
+  return out;
+}
+
+function safeReturnTo(val) {
+  if (!val) return '/';
+  try {
+    const decoded = decodeURIComponent(val);
+    const parsed = new URL(decoded, 'http://localhost');
+    if (parsed.pathname.startsWith('/') && !parsed.pathname.includes('..')) return parsed.pathname;
+  } catch {
+    // ignore
+  }
+  return '/';
+}
