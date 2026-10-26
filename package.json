@@ -1,0 +1,23 @@
+{
+  "name": "cgi-cctv-service-desk",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "CGI CCTV customer service and installation website: complaints, installation requests, technician scheduling and admin dashboard.",
+  "scripts": {
+    "build": "esbuild src/index.jsx --bundle --format=esm --platform=node --target=es2022 --jsx=automatic --jsx-import-source=hono/jsx --outfile=dist/worker.js --log-level=warning",
+    "dev": "npm run build && node scripts/dev.js",
+    "start": "node scripts/dev.js",
+    "start:render": "node render-entry.js"
+  },
+  "dependencies": {
+    "@freebuff/auth": "^0.1.0",
+    "@libsql/client": "^0.18.0",
+    "dotenv": "^16.4.7",
+    "hono": "^4.13.14"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "wrangler": "^4.152.0"
+  }
+}
