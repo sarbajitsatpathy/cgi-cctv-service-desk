@@ -41,7 +41,17 @@ const publicDir = join(__dirname, 'public');
 console.log('Starting server on port ' + PORT);
 console.log('DB: ' + DB_URL);
 
-const db = createClient({ url: DB_URL, authToken: DB_AUTH });
+// Open the database, but never let a bad path kill the process: Render's free
+// plan has no persistent disk, so a configured file URL can point at a
+// directory that does not exist. Fall back to in-memory and keep serving.
+let db;
+try {
+  db = createClient({ url: DB_URL, authToken: DB_AUTH });
+} catch (err) {
+  console.error('Could not open database at ' + DB_URL + ': ' + (err && err.message ? err.message : err));
+  console.error('Falling back to in-memory SQLite (data will not survive a restart).');
+  db = createClient({ url: 'file::memory:' });
+}
 
 async function ensureSchema() {
   try {
